@@ -137,8 +137,14 @@ def align_multi_iphone_data(demonstration_iterator, cfg: DictConfig):
             side_data = pose_data[side]
 
             rgb_indices = _compute_frame_indices(side_data["rgbTimes"], sample_times)
-            depth_times = side_data.get("depthTimes", side_data["rgbTimes"])
-            depth_indices = _compute_frame_indices(depth_times, sample_times)
+            depth_times = side_data.get("depthTimes") or []
+            # High-performance/no-LiDAR recordings intentionally have no depth frames.
+            # Keep aligned CSVs valid by indexing the blank placeholder frames that the
+            # visualization stage generates instead of emitting -1 for every sample.
+            if depth_times:
+                depth_indices = _compute_frame_indices(depth_times, sample_times)
+            else:
+                depth_indices = np.arange(sample_times.size, dtype=np.int64)
             ultrawide_indices = _compute_frame_indices(side_data["ultrawideRGBTimes"], sample_times, filter_empty=True)
 
             poses = np.asarray(side_data["poseTransforms"], dtype=np.float64)

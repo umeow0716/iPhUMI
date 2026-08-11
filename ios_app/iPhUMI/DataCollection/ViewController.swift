@@ -378,6 +378,10 @@ class ViewController: UIViewController, ARSessionDelegate {
     private var eventInteraction: AVCaptureEventInteraction?
     
     var fps: Double = 0
+    private let uiRefreshInterval: TimeInterval = 0.1
+    private var lastUIRefreshTimestamp: TimeInterval = -.infinity
+    private var ultrawideLensPositionCached = false
+    private var nextUltrawideLensPositionCheckTimestamp: TimeInterval = 0
     
     var mainIntrinsincs: simd_float3x3?
     var ultrawideIntrinsics: simd_float3x3?
@@ -451,14 +455,15 @@ class ViewController: UIViewController, ARSessionDelegate {
             defaults.set(useViewer, forKey: "useViewer")
         }
         self.useViewer = useViewer!
+        speechRecognizerEnabled = defaults.object(forKey: "speechRecognizerEnabled") as? Bool ?? true
+        ultrawideLensPositionCached = (defaults.object(forKey: "arKitUltrawideLensPosition") as? Float ?? 0) > 0
         
         initialSetPreferredMicToHeadset()
         
-        // init AR configuration
+        // Initialize AR configuration. Audio is only requested when voice recognition or
+        // contact-microphone recording needs it. Depth is intentionally not enabled.
         configuration = ARWorldTrackingConfiguration()
-        
-        // record audio
-        configuration?.providesAudioData = true
+        configuration?.providesAudioData = shouldProvideARAudioData
         
         // if using the viewer then initialize an ARView
         if useViewer! {
@@ -468,12 +473,26 @@ class ViewController: UIViewController, ARSessionDelegate {
         }
         
         updateTaskUI()
-        
-        speechRecognizerEnabled = UserDefaults.standard.object(forKey: "speechRecognizerEnabled") as? Bool ?? true
-        
         configureHardwareInteraction()
     }
     
+    private var shouldProvideARAudioData: Bool {
+        speechRecognizerEnabled || (micInitiallyFound && micCurrentlyConnected)
+    }
+
+    private func applyRuntimeARConfigurationChanges() {
+        guard let configuration else { return }
+        configuration.providesAudioData = shouldProvideARAudioData
+        configuration.isCollaborationEnabled = multipeerEnabled
+        configuration.environmentTexturing = .none
+        configuration.frameSemantics.remove(.sceneDepth)
+
+        // Running an existing configuration without reset options preserves tracking/world origin.
+        if isViewLoaded && view.window != nil {
+            session.run(configuration)
+        }
+    }
+
     func initialSetPreferredMicToHeadset() {
         let audioSession = AVAudioSession.sharedInstance()
         
@@ -535,19 +554,16 @@ class ViewController: UIViewController, ARSessionDelegate {
         // to create and set up your own configuration.
         arView?.automaticallyConfigureSession = false
 
-        // Enable a collaborative session.
-        configuration?.isCollaborationEnabled = true
-        
-        // Enable realistic reflections.
-        configuration?.environmentTexturing = .automatic
-        
-        // Enable the sceneDepth frame semantics
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration!.frameSemantics.insert(.sceneDepth)
-            print("added .sceneDepth from AR configuration")
-        } else {
-            print("Scene depth is not supported on this device.")
-        }
+        // Only pay for collaboration when multi-device collection is enabled.
+        configuration?.isCollaborationEnabled = multipeerEnabled
+
+        // Rendering features are unnecessary when collecting tracking/video data.
+        configuration?.environmentTexturing = .none
+
+        // Depth collection is disabled in this high-performance build. Explicitly remove the
+        // semantic in case this configuration object is reused after a prior session.
+        configuration?.frameSemantics.remove(.sceneDepth)
+        configuration?.providesAudioData = shouldProvideARAudioData
 
         // Reset session state so the local anchor countdown fires and MultipeerSession
         // is created fresh — handles both first launch and returning from a modal VC.
@@ -678,6 +694,11 @@ class ViewController: UIViewController, ARSessionDelegate {
                 liveSpeechRecognizer = SpeechRecognizer(shouldReportPartialResults: true, callback: narrationCallback)
                 liveSpeechRecognizer!.startTranscribingWithExternalAudio()
             }
+        }
+
+        applyRuntimeARConfigurationChanges()
+        if micInitiallyFound && micCurrentlyConnected {
+            warmUpAudioEncoderIfNeeded()
         }
     }
     
@@ -1353,7 +1374,21 @@ class ViewController: UIViewController, ARSessionDelegate {
             // create the demonstration data
             let gripperCalibrationRunName = defaults.object(forKey: "gripperCalibrationRunName") as? String
             
-            demonstrationData = DemonstrationData(recordingName: recordingName, side: phoneSide.recordingNameComponent, recordingStartTime: recordingStartTime!, demonstrationType: getDemonstrationType(), gripperCalibrationRunName: gripperCalibrationRunName!, sessionName: sessionName, gripperID: gripperID, labelType: tasksState.labelType, isVoiceHost: multipeerVoiceHost, sidesPresent: recordingSidesPresent, mainCameraIntrinsics: mainIntrinsincs!, ultrawideCameraIntrinsics: ultrawideIntrinsics!)
+            demonstrationData = DemonstrationData(
+                recordingName: recordingName,
+                side: phoneSide.recordingNameComponent,
+                recordingStartTime: recordingStartTime!,
+                demonstrationType: getDemonstrationType(),
+                gripperCalibrationRunName: gripperCalibrationRunName!,
+                sessionName: sessionName,
+                gripperID: gripperID,
+                labelType: tasksState.labelType,
+                isVoiceHost: multipeerVoiceHost,
+                sidesPresent: recordingSidesPresent,
+                mainCameraIntrinsics: mainIntrinsincs!,
+                ultrawideCameraIntrinsics: ultrawideIntrinsics!,
+                recordContactAudio: micInitiallyFound && micCurrentlyConnected
+            )
             demonstrationData?.isErrorCorrection = errorCorrectionMode && getDemonstrationType() == .Demonstration
 
             // start audio transcription
@@ -1762,10 +1797,8 @@ class ViewController: UIViewController, ARSessionDelegate {
     
     // ARSessionDelegate method
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        setRecordingMode(mode: self.recordingMode) // refresh recording state
-        
         if mainIntrinsincs == nil {
-            mainIntrinsincs = session.currentFrame?.camera.intrinsics
+            mainIntrinsincs = frame.camera.intrinsics
         }
         
         if ultrawideIntrinsics == nil {
@@ -1773,51 +1806,32 @@ class ViewController: UIViewController, ARSessionDelegate {
         }
 
         if arKitFirstFrameDate == nil { arKitFirstFrameDate = Date() }
-        let storedLensPosition = UserDefaults.standard.object(forKey: "arKitUltrawideLensPosition") as? Float ?? 0
-        if storedLensPosition == 0,
-           Date().timeIntervalSince(arKitFirstFrameDate!) >= 2.0,
-           let device = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
-           device.lensPosition > 0 {
-            UserDefaults.standard.set(device.lensPosition, forKey: "arKitUltrawideLensPosition")
+
+        let transform = frame.camera.transform
+        let timestamp = frame.timestamp
+        let arPoseDate = arTimeStampToDate(timestamp)
+        let dtFromPreviousFrame = timestamp - prevTimestampThisDevice
+        if dtFromPreviousFrame > 0 {
+            fps = 1 / dtFromPreviousFrame
         }
-        
-        // Compute L2 distance to each connected peer for display.
-        var peerDistances: [Float] = []
-        var updatedPeerSessionIDs: [String] = []
-        let myPosition = frame.camera.transform.columns.3
-        if !peerSessionIDs.isEmpty {
-            for anchor in frame.anchors {
-                guard
-                    let sessionID = anchor.sessionIdentifier?.uuidString,
-                    peerSessionIDs.values.contains(sessionID),
-                    sessionID == anchor.identifier.uuidString
-                else {
-                    continue
-                }
-                let peerPosition = anchor.transform.columns.3
-                let diff = simd_float3(myPosition.x - peerPosition.x,
-                                       myPosition.y - peerPosition.y,
-                                       myPosition.z - peerPosition.z)
-                peerDistances.append(simd_length(diff))
-                updatedPeerSessionIDs.append(sessionID)
+
+        // Lens position is calibration metadata, not frame data. Check at most twice per second
+        // until it becomes available instead of querying UserDefaults/AVCaptureDevice at 60 Hz.
+        if !ultrawideLensPositionCached,
+           timestamp >= nextUltrawideLensPositionCheckTimestamp,
+           Date().timeIntervalSince(arKitFirstFrameDate!) >= 2.0 {
+            nextUltrawideLensPositionCheckTimestamp = timestamp + 0.5
+            if let device = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
+               device.lensPosition > 0 {
+                UserDefaults.standard.set(device.lensPosition, forKey: "arKitUltrawideLensPosition")
+                ultrawideLensPositionCached = true
             }
         }
-        
-        let defaults = UserDefaults.standard
-        var currentDate = Date()
-        
-        // pose of this iPhone
-        let transform = frame.camera.transform
-        let timestamp = frame.timestamp // in seconds
-        let arPoseDate = arTimeStampToDate(timestamp)
-        let x = transform.columns.3.x
-        let y = transform.columns.3.y
-        let z = transform.columns.3.z
-        fps = 1 / (timestamp - self.prevTimestampThisDevice)
-        
+
         if isRecording {
-            // abort demonstration if fps drops from 60 to 30
-            // sometimes the FPS temporarily drops right at the start of the recording and then goes back up to 60. In those cases we will only abandon the recording if the FPS drops after the first second of recording
+            let currentDate = Date()
+
+            // Abort demonstration if FPS drops from 60 to 30. Ignore transient startup drops.
             if fps < 31 && currentDate.timeIntervalSince1970 - recordingStartTime!.timeIntervalSince1970 > 1 {
                 let wasInitiator = iAmRecordingInitiator
                 let droppedSide = phoneSide.recordingNameComponent
@@ -1825,14 +1839,13 @@ class ViewController: UIViewController, ARSessionDelegate {
                 if wasInitiator { fpsDropAlert(side: droppedSide) }
             }
 
-            // abort demonstration if pose jump exceeds threshold
-            let dt = timestamp - prevTimestampThisDevice
-            if let prevPose = previousRecordingPoseTransform, dt > 0 {
+            // Abort demonstration if pose jump exceeds threshold.
+            if let prevPose = previousRecordingPoseTransform, dtFromPreviousFrame > 0 {
                 let prevPos = prevPose.columns.3
                 let dx = Double(transform.columns.3.x - prevPos.x)
                 let dy = Double(transform.columns.3.y - prevPos.y)
                 let dz = Double(transform.columns.3.z - prevPos.z)
-                let metersPerSecond = sqrt(dx*dx + dy*dy + dz*dz) / dt
+                let metersPerSecond = sqrt(dx * dx + dy * dy + dz * dz) / dtFromPreviousFrame
                 maxRecordingPoseDeltaMetersPerSecond = max(maxRecordingPoseDeltaMetersPerSecond, metersPerSecond)
                 if metersPerSecond > maxPoseDeltaMetersPerSecond {
                     let wasInitiator = iAmRecordingInitiator
@@ -1844,52 +1857,83 @@ class ViewController: UIViewController, ARSessionDelegate {
             if isRecording { previousRecordingPoseTransform = transform }
 
             let ultrawideImage = frame.getCapturedUltraWideImage()
-            let ultrawideTime = frame.getUltraWideTimestamp()
-            let ultrawideDate = ultrawideTime != nil ? arTimeStampToDate(ultrawideTime!) : nil
-
-            demonstrationData?.logFrame(pose: transform, poseTime: arPoseDate, rgb: frame.capturedImage, depthMap: frame.sceneDepth?.depthMap, ultrawidergb: ultrawideImage, arkitTimestamp: frame.timestamp)
+            demonstrationData?.logFrame(
+                pose: transform,
+                poseTime: arPoseDate,
+                rgb: frame.capturedImage,
+                ultrawidergb: ultrawideImage,
+                arkitTimestamp: timestamp
+            )
         }
 
-        let displayString = "Cur iPhone:     x: \(String(format: "%.4f", transform[3][0])), y: \(String(format: "%.4f", transform[3][1])), z: \(String(format: "%.4f", transform[3][2])), fps: \(String(format: "%.3f", fps))"
-//        print(displayString)
         prevTimestampThisDevice = timestamp
-        
-        // update the UI label
-        let minePoseText = poseToText(transform, fps)
-        let sessionName = (defaults.object(forKey: "sessionName") as? String)!
-        let peerCount = multipeerSession?.connectedPeers.count ?? 0
-        let capturedUseViewer = useViewer
-        let capturedIsRecording = isRecording
-        let capturedMaxPoseDelta = maxRecordingPoseDeltaMetersPerSecond
-        let capturedUpdatedPeerSessionIDs = updatedPeerSessionIDs
-        DispatchQueue.main.async {
-            self.cachedPeerDistances = peerDistances
-            let now = Date()
-            for sid in capturedUpdatedPeerSessionIDs { self.lastPeerPoseDates[sid] = now }
-            self.poseLabel.text = minePoseText
-            for (index, dist) in peerDistances.enumerated() {
-                self.poseLabel.text! += "\nPeer\(index + 1): \(String(format: "%.3f", dist))m"
+
+        // UI/readiness state does not need 60 Hz updates. Keep the recording/tracking path at
+        // full frame rate while reducing main-thread work to 10 Hz.
+        if timestamp - lastUIRefreshTimestamp >= uiRefreshInterval {
+            lastUIRefreshTimestamp = timestamp
+            setRecordingMode(mode: recordingMode)
+
+            var peerDistances: [Float] = []
+            var updatedPeerSessionIDs: [String] = []
+            if !peerSessionIDs.isEmpty {
+                let myPosition = transform.columns.3
+                for anchor in frame.anchors {
+                    guard
+                        let sessionID = anchor.sessionIdentifier?.uuidString,
+                        peerSessionIDs.values.contains(sessionID),
+                        sessionID == anchor.identifier.uuidString
+                    else {
+                        continue
+                    }
+                    let peerPosition = anchor.transform.columns.3
+                    let diff = simd_float3(
+                        myPosition.x - peerPosition.x,
+                        myPosition.y - peerPosition.y,
+                        myPosition.z - peerPosition.z
+                    )
+                    peerDistances.append(simd_length(diff))
+                    updatedPeerSessionIDs.append(sessionID)
+                }
             }
 
-            if self.multipeerEnabled { self.peerCountLabel.text = "Peers: \(peerCount)" }
-            self.stateLabel.text = ""
-            self.stateLabel.text! += "Session: \(sessionName)"
-            self.stateLabel.text! += "\nGripper ID: \(self.gripperID)"
-            self.stateLabel.text! += "\nDemos: \(self.cachedDemoCount) (\(self.cachedTotalDemoCount)) | Calibs: \(self.cachedCalibCount) (\(self.cachedTotalCalibCount))"
-            self.stateLabel.text! += "\nVoice commands: \(self.speechRecognizerEnabled ? "on" : "off")"
-            if peerCount > 0 {
-                self.stateLabel.text! += "\nVoice host: \(self.multipeerVoiceHost ? "on" : "off")"
-            }
-            if capturedUseViewer {
-                self.stateLabel.text! += "\nWARNING: viewer degrades performance"
-            }
-            if capturedIsRecording {
-                self.stateLabel.text! += "\nMax Δpose: \(String(format: "%.2f", capturedMaxPoseDelta)) m/s"
+            let minePoseText = poseToText(transform, fps)
+            let sessionName = (UserDefaults.standard.object(forKey: "sessionName") as? String) ?? "no-session"
+            let peerCount = multipeerSession?.connectedPeers.count ?? 0
+            let capturedUseViewer = useViewer
+            let capturedIsRecording = isRecording
+            let capturedMaxPoseDelta = maxRecordingPoseDeltaMetersPerSecond
+
+            DispatchQueue.main.async {
+                self.cachedPeerDistances = peerDistances
+                let now = Date()
+                for sid in updatedPeerSessionIDs { self.lastPeerPoseDates[sid] = now }
+
+                var poseText = minePoseText
+                for (index, dist) in peerDistances.enumerated() {
+                    poseText += "\nPeer\(index + 1): \(String(format: "%.3f", dist))m"
+                }
+                self.poseLabel.text = poseText
+
+                if self.multipeerEnabled { self.peerCountLabel.text = "Peers: \(peerCount)" }
+
+                var stateText = "Session: \(sessionName)"
+                stateText += "\nGripper ID: \(self.gripperID)"
+                stateText += "\nDemos: \(self.cachedDemoCount) (\(self.cachedTotalDemoCount)) | Calibs: \(self.cachedCalibCount) (\(self.cachedTotalCalibCount))"
+                stateText += "\nVoice commands: \(self.speechRecognizerEnabled ? "on" : "off")"
+                if peerCount > 0 {
+                    stateText += "\nVoice host: \(self.multipeerVoiceHost ? "on" : "off")"
+                }
+                if capturedUseViewer {
+                    stateText += "\nWARNING: viewer degrades performance"
+                }
+                if capturedIsRecording {
+                    stateText += "\nMax Δpose: \(String(format: "%.2f", capturedMaxPoseDelta)) m/s"
+                }
+                self.stateLabel.text = stateText
             }
         }
-        
 
-        
         // countdown to add world anchor
         if peerParticipantAnchorFound {
             if worldAnchorCountdown == 0 {
@@ -2564,28 +2608,47 @@ class ViewController: UIViewController, ARSessionDelegate {
         messageLabel.displayMessage("Cleared world frame anchors (all peers disconnected)")
     }
 
-    private var videoEncodersWarmedUp = false
-    private func warmUpVideoEncodersIfNeeded() {
-        guard !videoEncodersWarmedUp else { return }
-        videoEncodersWarmedUp = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            // Creating AVAssetWriter + AVAssetWriterInput the first time spins up the
-            // hardware H.264 and AAC encoder stacks, which takes ~200 ms and causes a
-            // visible FPS drop on the very first recording.  Creating and immediately
-            // cancelling dummy writers here primes those stacks so the first real
-            // recording starts cleanly.
-            let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("encoder_warmup_\(UUID().uuidString).mov")
-            guard let writer = try? AVAssetWriter(outputURL: tempURL, fileType: .mov) else { return }
+    private var videoEncoderWarmedUp = false
+    private var audioEncoderWarmedUp = false
 
-            let videoSettings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: 1920,
-                AVVideoHeightKey: 1440
-            ]
-            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-            videoInput.expectsMediaDataInRealTime = true
-            writer.add(videoInput)
+    private func warmUpVideoEncodersIfNeeded() {
+        if !videoEncoderWarmedUp {
+            videoEncoderWarmedUp = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Creating the H.264 encoder stack for the first time can cause a visible FPS
+                // drop on the first recording. Prime it before data collection begins.
+                let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("video_encoder_warmup_\(UUID().uuidString).mov")
+                guard let writer = try? AVAssetWriter(outputURL: tempURL, fileType: .mov) else { return }
+
+                let videoSettings: [String: Any] = [
+                    AVVideoCodecKey: AVVideoCodecType.h264,
+                    AVVideoWidthKey: 1920,
+                    AVVideoHeightKey: 1440
+                ]
+                let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+                videoInput.expectsMediaDataInRealTime = true
+                writer.add(videoInput)
+
+                writer.startWriting()
+                writer.cancelWriting()
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
+
+        if micInitiallyFound && micCurrentlyConnected {
+            warmUpAudioEncoderIfNeeded()
+        }
+    }
+
+    private func warmUpAudioEncoderIfNeeded() {
+        guard !audioEncoderWarmedUp else { return }
+        audioEncoderWarmedUp = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("audio_encoder_warmup_\(UUID().uuidString).mov")
+            guard let writer = try? AVAssetWriter(outputURL: tempURL, fileType: .mov) else { return }
 
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
@@ -2727,6 +2790,7 @@ class ViewController: UIViewController, ARSessionDelegate {
             guard let self else { return }
             self.multipeerEnabled = enabled
             self.updatePeerUI(multipeerEnabled: enabled)
+            self.applyRuntimeARConfigurationChanges()
             if enabled {
                 guard self.multipeerSession == nil else { return }
                 self.multipeerSession = MultipeerSession(receivedDataHandler: self.receivedData,
@@ -2745,6 +2809,7 @@ class ViewController: UIViewController, ARSessionDelegate {
         settings.onSpeechRecognizerToggled = { [weak self] enabled in
             guard let self else { return }
             self.speechRecognizerEnabled = enabled
+            self.applyRuntimeARConfigurationChanges()
             if enabled {
                 self.liveSpeechRecognizer = SpeechRecognizer(shouldReportPartialResults: true, callback: self.narrationCallback)
                 self.liveSpeechRecognizer!.startTranscribingWithExternalAudio()

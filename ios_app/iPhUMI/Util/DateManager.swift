@@ -9,11 +9,13 @@
 import Foundation
 
 class DateManager {
-    
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
     static func getISOFormatter() -> ISO8601DateFormatter {
-        let dateFormatter = ISO8601DateFormatter()
-        dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return dateFormatter
+        isoFormatter
     }
-    
 }

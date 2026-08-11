@@ -108,8 +108,12 @@ enum DemonstrationSaveType: String, Codable, CaseIterable {
     case JSON
     case RGB
     case UltrawideRGB
+    // Legacy types are retained so recordings made by older builds can still be viewed/deleted.
+    // New recordings do not create these files and exports intentionally omit them.
     case DepthMap
     case DepthPreviewMap
+
+    static let exportTypes: [DemonstrationSaveType] = [.JSON, .RGB, .UltrawideRGB]
 }
 
 class DemonstrationData : Codable {
@@ -150,9 +154,7 @@ class DemonstrationData : Codable {
     var recordingName: String
     var rgbVideoWriter: VideoWriter?
     var ultrawideRGBVideoWriter: VideoWriter?
-    var depthVideoWriter: DepthVideoWriter?
-    var depthPreviewVideoWriter: DepthPreviewVideoWriter?
-    var lastDepthPixelBuffer: CVPixelBuffer? = nil
+    private var recordContactAudio: Bool = false
     var frameCount: Int = 0
     
     private enum CodingKeys : String, CodingKey {
@@ -229,14 +231,13 @@ class DemonstrationData : Codable {
         // recordingName is not stored in JSON, so set to empty string
         recordingName = ""
         
-        // Initialize video writers as nil (they are not stored in JSON)
+        // Initialize runtime-only recording state (not stored in JSON).
         rgbVideoWriter = nil
         ultrawideRGBVideoWriter = nil
-        depthVideoWriter = nil
-        depthPreviewVideoWriter = nil
+        recordContactAudio = false
     }
     
-    init(recordingName: String, side: String, recordingStartTime: Date, demonstrationType: DemonstrationType, gripperCalibrationRunName: String, sessionName: String, gripperID: String, labelType: DemonstrationLabelType, isVoiceHost: Bool, sidesPresent: [String], mainCameraIntrinsics: simd_float3x3, ultrawideCameraIntrinsics: simd_float3x3) {
+    init(recordingName: String, side: String, recordingStartTime: Date, demonstrationType: DemonstrationType, gripperCalibrationRunName: String, sessionName: String, gripperID: String, labelType: DemonstrationLabelType, isVoiceHost: Bool, sidesPresent: [String], mainCameraIntrinsics: simd_float3x3, ultrawideCameraIntrinsics: simd_float3x3, recordContactAudio: Bool) {
         self.side = side
         self.sidesPresent = sidesPresent
         self.recordingName = recordingName
@@ -246,11 +247,14 @@ class DemonstrationData : Codable {
         self.gripperID = gripperID
         self.hasRGB = demonstrationType == .Demonstration
         self.hasUltrawideRGB = true
-        self.hasDepth = demonstrationType == .Demonstration
+        // Depth capture is intentionally disabled in the high-performance data collection path.
+        // Keep the JSON field for backwards compatibility with existing processing code.
+        self.hasDepth = false
         self.labelType = labelType
         self.isVoiceHost = isVoiceHost
         self.mainCameraIntrinsics = mainCameraIntrinsics
         self.ultrawideCameraIntrinsics = ultrawideCameraIntrinsics
+        self.recordContactAudio = recordContactAudio && demonstrationType == .Demonstration
         
         // start recording time
         self.recordingStartTime = "" // need to do this for next line to work
@@ -261,23 +265,27 @@ class DemonstrationData : Codable {
     }
     
     func logAudio(audioSampleBuffer: CMSampleBuffer) {
-        if type == .Demonstration {
-            ultrawideRGBVideoWriter?.appendAudio(sampleBuffer: audioSampleBuffer)
-            rgbVideoWriter?.appendAudio(sampleBuffer: audioSampleBuffer)
-            hasAudio = true
-        }
+        guard type == .Demonstration, recordContactAudio else { return }
+        ultrawideRGBVideoWriter?.appendAudio(sampleBuffer: audioSampleBuffer)
+        rgbVideoWriter?.appendAudio(sampleBuffer: audioSampleBuffer)
+        hasAudio = true
     }
     
-    func logFrame(pose: simd_float4x4, poseTime: Date, rgb: CVPixelBuffer, depthMap: CVPixelBuffer?, ultrawidergb: CVPixelBuffer?, arkitTimestamp: TimeInterval) {
+    func logFrame(pose: simd_float4x4, poseTime: Date, rgb: CVPixelBuffer, ultrawidergb: CVPixelBuffer?, arkitTimestamp: TimeInterval) {
         let poseTime = DateManager.getISOFormatter().string(from: poseTime)
-        let arkitTimeString = String(format: "%.5f", arkitTimestamp)
-        let frameTime = CMTimeMake(value: Int64(arkitTimestamp*10000), timescale: 10000) // trick to represent float as fraction
+        let frameTime = CMTimeMake(value: Int64(arkitTimestamp * 10000), timescale: 10000)
         
-        // setup the RGB video writer if this is the first frame
+        // Set up the main RGB writer on the first frame. Avoid creating an AAC input unless
+        // a contact microphone is actually being recorded.
         if self.hasRGB && rgbVideoWriter == nil {
             do {
                 let rgbOutputUrl = try self.getURL(demonstrationSaveType: .RGB)
-                self.rgbVideoWriter = try VideoWriter(outputURL: rgbOutputUrl, width: CVPixelBufferGetWidth(rgb), height: CVPixelBufferGetHeight(rgb), includeAudio: true)
+                self.rgbVideoWriter = try VideoWriter(
+                    outputURL: rgbOutputUrl,
+                    width: CVPixelBufferGetWidth(rgb),
+                    height: CVPixelBufferGetHeight(rgb),
+                    includeAudio: recordContactAudio
+                )
                 self.rgbVideoWriter!.startWriting(at: frameTime)
             } catch {
                 print("Failed to open video writer for RGB")
@@ -287,35 +295,19 @@ class DemonstrationData : Codable {
         if self.hasUltrawideRGB && ultrawideRGBVideoWriter == nil, let ultrawidergb = ultrawidergb {
             do {
                 let rgbOutputUrl = try self.getURL(demonstrationSaveType: .UltrawideRGB)
-                self.ultrawideRGBVideoWriter = try VideoWriter(outputURL: rgbOutputUrl, width: CVPixelBufferGetWidth(ultrawidergb), height: CVPixelBufferGetHeight(ultrawidergb), includeAudio: true)
+                self.ultrawideRGBVideoWriter = try VideoWriter(
+                    outputURL: rgbOutputUrl,
+                    width: CVPixelBufferGetWidth(ultrawidergb),
+                    height: CVPixelBufferGetHeight(ultrawidergb),
+                    includeAudio: recordContactAudio
+                )
                 self.ultrawideRGBVideoWriter!.startWriting(at: frameTime)
             } catch {
                 print("Failed to open video writer for ultrawide RGB")
             }
         }
         
-        if depthMap == nil && depthVideoWriter == nil {
-            // nil on the first depth frame means the device has no LiDAR
-            hasDepth = false
-        }
-
-        // setup the depth video writer if this is the first frame
-        if self.hasDepth && depthVideoWriter == nil { // some devices don't have LiDAR so depthMap can be nil
-            do {
-                let depthOutputUrl = try self.getURL(demonstrationSaveType: .DepthMap)
-                self.depthVideoWriter = try DepthVideoWriter(outputURL: depthOutputUrl, width: CVPixelBufferGetWidth(depthMap!), height: CVPixelBufferGetHeight(depthMap!))
-
-                let depthPreviewOutputUrl = try self.getURL(demonstrationSaveType: .DepthPreviewMap)
-                self.depthPreviewVideoWriter = try DepthPreviewVideoWriter(outputURL: depthPreviewOutputUrl, width: CVPixelBufferGetWidth(depthMap!), height: CVPixelBufferGetHeight(depthMap!))
-                self.depthPreviewVideoWriter!.startWriting(at: frameTime)
-            } catch {
-                print("Failed to open video writer for depth")
-            }
-        }
-        
         if self.hasRGB {
-            // save the RGB image
-//            print("Image dimensions: W: \(CVPixelBufferGetWidth(rgb)) H: \(CVPixelBufferGetHeight(rgb))")
             rgbVideoWriter!.appendVideo(pixelBuffer: rgb, at: frameTime)
             rgbTimes.append(poseTime)
         }
@@ -329,19 +321,7 @@ class DemonstrationData : Codable {
             }
         }
         
-        if self.hasDepth, let depthVideoWriter = depthVideoWriter {
-            let frameToWrite = depthMap ?? lastDepthPixelBuffer
-            if let frameToWrite = frameToWrite {
-                let isRepeat = depthMap == nil
-                depthVideoWriter.append(pixelBuffer: frameToWrite)
-                depthPreviewVideoWriter!.append(pixelBuffer: frameToWrite, at: frameTime)
-                depthTimes.append(poseTime)
-                depthFrameIsRepeat.append(isRepeat)
-                if !isRepeat { lastDepthPixelBuffer = depthMap }
-            }
-        }
-        
-        // only need to save pose times and transforms if it's a demonstration
+        // Only demonstrations require pose trajectories; gripper calibration uses ultrawide tags.
         if type == .Demonstration {
             poseTimes.append(poseTime)
             poseTransforms.append(pose)
@@ -601,19 +581,6 @@ class DemonstrationData : Codable {
             }
         }
 
-        if depthVideoWriter != nil {
-            depthVideoWriter!.finishWriting()
-            let outURL = try? self.getURL(demonstrationSaveType: .DepthMap)
-            print("Video writing finished: \(outURL!)")
-
-            group.enter()
-            depthPreviewVideoWriter!.finishWriting {
-                let outURL = try? self.getURL(demonstrationSaveType: .DepthPreviewMap)
-                print("Video writing finished: \(outURL!)")
-                group.leave()
-            }
-        }
-
         group.wait()
     }
     
@@ -623,7 +590,7 @@ class DemonstrationData : Codable {
         // should only be called after saveLocally is called
         // already-present files are skipped so a failed export can be resumed
         var anyNewFile = false
-        for dataType in DemonstrationSaveType.allCases {
+        for dataType in DemonstrationSaveType.exportTypes {
             if Self.hasDataType(recordingName: recordingName, demonstrationSaveType: dataType) {
                 let file = try DemonstrationData.getURL(recordingName: recordingName, demonstrationSaveType: dataType)
                 let destination = directoryURL.appendingPathComponent(file.lastPathComponent)
